@@ -181,6 +181,7 @@ jobs:
           packages-dir: dist/
           print-hash: true
           password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
 
       - name: Attach Artifacts to GitHub Release
         env:
