@@ -94,6 +94,15 @@ class TestCookies:
         names = [c["name"] for c in payload["requestCookies"]]
         assert "temp" in names
 
+    def test_cookie_port_matching(self, session):
+        resp = make_response(url="https://site-a.com:8443/", cookies={"sid": "abc"})
+        session._sync_cookies(resp)
+        # Cookie set on custom port should be sent to same host with or without explicit port
+        p1 = session._prepare_payload("GET", "https://site-a.com:8443/api")
+        assert "sid" in [c["name"] for c in p1["requestCookies"]]
+        p2 = session._prepare_payload("GET", "https://site-a.com/api")
+        assert "sid" in [c["name"] for c in p2["requestCookies"]]
+
 
 class TestLifecycle:
     def test_context_manager_closes(self, monkeypatch):
@@ -113,6 +122,12 @@ class TestLifecycle:
     def test_close_is_idempotent(self, session):
         assert session.close() is True
         assert session.close() is True
+
+    @pytest.mark.asyncio
+    async def test_close_async_is_idempotent(self, session):
+        assert await session.close_async() is True
+        assert await session.close_async() is True
+        assert session._closed is True
 
     def test_request_after_close_raises(self, session):
         session.close()
@@ -188,3 +203,38 @@ class TestRequestLoop:
         session.backend.queue.append({"status": 0, "body": "go failed"})
         with pytest.raises(Exception):
             session.get("https://example.com/")
+
+    def test_params_encoding_multi_value(self, session):
+        payload = session._prepare_payload("GET", "https://example.com/items", params={"tag": ["rust", "python"]})
+        assert payload["requestUrl"] == "https://example.com/items?tag=rust&tag=python"
+
+    def test_params_preserves_existing_url_query(self, session):
+        payload = session._prepare_payload("GET", "https://example.com/search?q=test&lang=en", params={"page": 2})
+        assert payload["requestUrl"] == "https://example.com/search?q=test&lang=en&page=2"
+
+    def test_form_data_encoding_multi_value(self, session):
+        payload = session._prepare_payload("POST", "https://example.com/form", data={"choice": ["opt1", "opt2"]})
+        assert payload["requestBody"] == "choice=opt1&choice=opt2"
+        assert payload["headers"]["content-type"] == "application/x-www-form-urlencoded"
+
+    def test_client_hints_alignment(self):
+        from horaa_tls.fingerprint.user_agent import UserAgentGenerator
+        headers = {
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Ch-Ua-Mobile": "?0",
+        }
+        # macOS
+        aligned = UserAgentGenerator.align_client_hints(
+            headers.copy(),
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        assert aligned["Sec-Ch-Ua-Platform"] == '"macOS"'
+        assert aligned["Sec-Ch-Ua-Mobile"] == "?0"
+
+        # Android
+        aligned_android = UserAgentGenerator.align_client_hints(
+            headers.copy(),
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+        )
+        assert aligned_android["Sec-Ch-Ua-Platform"] == '"Android"'
+        assert aligned_android["Sec-Ch-Ua-Mobile"] == "?1"

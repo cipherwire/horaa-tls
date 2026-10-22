@@ -7,9 +7,10 @@ name = "horaa-tls"
 version = "0.2.0"
 description = "Advanced HTTP client with low-level TLS and browser fingerprint spoofing based on Go tls-client FFI"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
-    { name = "Amit Haina" }
+    { name = "cipherwire" }
 ]
 keywords = ["tls", "http-client", "fingerprint", "anti-bot", "ja3", "ja4", "impersonation"]
 classifiers = [
@@ -18,7 +19,6 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Intended Audience :: Developers",
     "Topic :: Internet :: WWW/HTTP",
@@ -28,9 +28,10 @@ requires-python = ">=3.10"
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/AmitHaina/horaa-tls"
-Repository = "https://github.com/AmitHaina/horaa-tls"
-Issues = "https://github.com/AmitHaina/horaa-tls/issues"
+Homepage = "https://github.com/cipherwire/horaa-tls"
+Repository = "https://github.com/cipherwire/horaa-tls"
+Issues = "https://github.com/cipherwire/horaa-tls/issues"
+Changelog = "https://github.com/cipherwire/horaa-tls/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
@@ -58,6 +59,9 @@ packages = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "integration: marks tests as native network integration tests",
+]
 
 [tool.ruff]
 line-length = 120

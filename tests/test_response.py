@@ -20,7 +20,22 @@ class TestCaseInsensitiveDict:
     def test_equality_with_plain_dict(self):
         h = CaseInsensitiveDict({"Content-Type": "application/json"})
         assert h == {"Content-Type": "application/json"}
+        assert h == {"content-type": "application/json"}
+        assert h == {"CONTENT-TYPE": "application/json"}
         assert h != {"Content-Type": "text/html"}
+
+    def test_equality_with_differently_cased_case_insensitive_dict(self):
+        h1 = CaseInsensitiveDict({"Content-Type": "application/json"})
+        h2 = CaseInsensitiveDict({"content-type": "application/json"})
+        assert h1 == h2
+
+    def test_popitem(self):
+        h = CaseInsensitiveDict({"Content-Type": "application/json"})
+        key, val = h.popitem()
+        assert key == "Content-Type"
+        assert val == "application/json"
+        assert "content-type" not in h
+        assert len(h) == 0
 
     def test_pop_works(self):
         h = CaseInsensitiveDict({"Content-Type": "application/json"})
@@ -129,3 +144,48 @@ class TestBuildResponse:
     def test_json_bom_tolerated(self):
         r = build_response({"status": 200, "headers": {}, "body": "\ufeff{\"a\": 1}"})
         assert r.json() == {"a": 1}
+
+
+class TestResponseExtensions:
+    def test_case_insensitive_dict_getlist(self):
+        h = CaseInsensitiveDict({"A": "1"})
+        assert h.getlist("A") == ["1"]
+        assert h.getlist("a") == ["1"]
+        assert h.getlist("missing") == []
+        assert h.getlist("missing", ["default"]) == ["default"]
+
+    def test_build_response_multi_headers_getlist(self):
+        r = build_response({
+            "status": 200,
+            "target": "https://example.com",
+            "headers": {
+                "Set-Cookie": ["sid=123; Path=/", "uid=456; Path=/"],
+                "X-Custom": ["val1", "val2"],
+            }
+        })
+        assert r.headers.getlist("set-cookie") == ["sid=123; Path=/", "uid=456; Path=/"]
+        assert r.headers.get_all("X-Custom") == ["val1", "val2"]
+        assert r.headers["set-cookie"] == "sid=123; Path=/, uid=456; Path=/"
+
+    def test_response_iter_content_chunks(self):
+        r = build_response({"status": 200, "headers": {}, "body": "abcdefghij"}, is_byte_response=False)
+        chunks = list(r.iter_content(chunk_size=3))
+        assert chunks == [b"abc", b"def", b"ghi", b"j"]
+
+    def test_response_iter_content_unicode(self):
+        r = build_response({"status": 200, "headers": {}, "body": "hello world"}, is_byte_response=False)
+        chunks = list(r.iter_content(chunk_size=5, decode_unicode=True))
+        assert chunks == ["hello", " worl", "d"]
+
+    def test_response_iter_lines_simple(self):
+        body = 'line1\nline2\r\nline3\rline4'
+        r = build_response({'status': 200, 'headers': {}, 'body': body}, is_byte_response=False)
+        lines = list(r.iter_lines())
+        assert lines == ['line1', 'line2', 'line3', 'line4']
+
+    def test_response_context_manager(self):
+        r = build_response({'status': 200, 'headers': {}, 'body': 'ok'}, is_byte_response=False)
+        with r as resp:
+            assert resp.status_code == 200
+            assert resp.text == 'ok'
+        resp.close()

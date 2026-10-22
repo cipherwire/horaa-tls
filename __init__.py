@@ -21,7 +21,7 @@ from horaa_tls.response import CaseInsensitiveDict, Protocol, Response
 try:
     __version__ = _package_version("horaa-tls")
 except PackageNotFoundError:  # running from a source checkout
-    __version__ = "0.1.6"
+    __version__ = "0.2.0"
 
 # Library best practice: never configure handlers, just silence
 # "No handlers could be found" noise unless the app opted in.
