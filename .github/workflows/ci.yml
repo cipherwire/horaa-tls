@@ -55,17 +55,14 @@ jobs:
           with open('.release-please-manifest.json', 'r', encoding='utf-8') as f:
               manifest_ver = json.load(f)['.']
 
-          with open('__init__.py', 'r', encoding='utf-8') as f:
-              init_text = f.read()
-              m = re.search(r'__version__\s*=\s*[\"\']([^\"\']+)[\"\']', init_text)
-              init_ver = m.group(1) if m else None
+          from horaa_tls import __version__ as pkg_ver
 
           print(f'pyproject.toml version:             {pyproj_ver}')
           print(f'.release-please-manifest.json version: {manifest_ver}')
-          print(f'__init__.py fallback version:         {init_ver}')
+          print(f'horaa_tls.__version__:                {pkg_ver}')
 
           assert pyproj_ver == manifest_ver, f'Mismatch: pyproject ({pyproj_ver}) != manifest ({manifest_ver})'
-          assert pyproj_ver == init_ver, f'Mismatch: pyproject ({pyproj_ver}) != __init__.py ({init_ver})'
+          assert pyproj_ver == pkg_ver, f'Mismatch: pyproject ({pyproj_ver}) != horaa_tls.__version__ ({pkg_ver})'
           print('All version declarations are perfectly synchronized!')
           "
 
