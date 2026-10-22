@@ -53,7 +53,7 @@ jobs:
       )
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
     outputs:
       release_tag: ${{ steps.resolve-tag.outputs.tag }}
     steps:
@@ -150,6 +150,14 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+      - name: Attach Artifacts to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.resolve-tag.outputs.tag }}"
+          echo "Attaching built assets to GitHub Release: $TAG"
+          gh release upload "$TAG" dist/* --clobber || echo "Notice: release upload skipped or release $TAG not created yet." 
+
   publish-pypi:
     name: Publish to PyPI (OIDC Trusted Publishing)
     needs: [build-and-verify]
@@ -172,6 +180,7 @@ jobs:
         with:
           packages-dir: dist/
           print-hash: true
+          password: ${{ secrets.PYPI_API_TOKEN }}
 
       - name: Attach Artifacts to GitHub Release
         env:
