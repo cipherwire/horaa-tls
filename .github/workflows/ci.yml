@@ -4,21 +4,74 @@ on:
   push:
     branches: [main, master]
   pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+permissions:
+  contents: read
 
 jobs:
   lint:
+    name: Lint & Format Check (Ruff)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
         with:
           python-version: "3.12"
+
       - name: Install ruff
-        run: pip install ruff
-      - name: Lint
+        run: python -m pip install --upgrade ruff
+
+      - name: Run ruff linter
         run: ruff check .
 
+  version-consistency:
+    name: Verify Version Metadata Consistency
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Check version consistency across metadata files
+        run: |
+          python -c "
+          import json, re, tomllib
+
+          with open('pyproject.toml', 'rb') as f:
+              pyproj_ver = tomllib.load(f)['project']['version']
+
+          with open('.release-please-manifest.json', 'r', encoding='utf-8') as f:
+              manifest_ver = json.load(f)['.']
+
+          with open('__init__.py', 'r', encoding='utf-8') as f:
+              init_text = f.read()
+              m = re.search(r'__version__\s*=\s*[\"\']([^\"\']+)[\"\']', init_text)
+              init_ver = m.group(1) if m else None
+
+          print(f'pyproject.toml version:             {pyproj_ver}')
+          print(f'.release-please-manifest.json version: {manifest_ver}')
+          print(f'__init__.py fallback version:         {init_ver}')
+
+          assert pyproj_ver == manifest_ver, f'Mismatch: pyproject ({pyproj_ver}) != manifest ({manifest_ver})'
+          assert pyproj_ver == init_ver, f'Mismatch: pyproject ({pyproj_ver}) != __init__.py ({init_ver})'
+          print('All version declarations are perfectly synchronized!')
+          "
+
   test:
+    name: Unit & Regression Tests (${{ matrix.os }} - Py ${{ matrix.python-version }})
+    needs: [lint, version-consistency]
     strategy:
       fail-fast: false
       matrix:
@@ -26,14 +79,96 @@ jobs:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install package
-        run: pip install -e .[dev]
-      - name: Run tests
-        env:
-          # Keep CI hermetic: tests must not download the Go library.
-          TLS_LIBRARY_PATH: ""
-        run: pytest -v
+          cache: "pip"
+          cache-dependency-path: "pyproject.toml"
+
+      - name: Install dependencies and package (editable)
+        run: python -m pip install -e .[dev]
+
+      - name: Run hermetic unit and regression tests
+        run: pytest -v -m "not integration"
+
+  native-integration:
+    name: Native Backend Live Integration Tests (${{ matrix.os }})
+    needs: [test]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: "pyproject.toml"
+
+      - name: Install dependencies and package (editable)
+        run: python -m pip install -e .[dev]
+
+      - name: Run live native integration tests
+        run: pytest -v -m "integration"
+
+  package-verify:
+    name: Build & Isolated Install Smoke Test
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install packaging tools
+        run: python -m pip install --upgrade build twine
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Check package metadata with twine
+        run: python -m twine check --strict dist/*
+
+      - name: Verify wheel contents cleanliness
+        run: |
+          python -c "
+          import zipfile, glob, sys
+          wheels = glob.glob('dist/*.whl')
+          if not wheels:
+              sys.exit('No wheel found in dist/')
+          with zipfile.ZipFile(wheels[0]) as z:
+              names = z.namelist()
+              for name in names:
+                  print('Wheel entry:', name)
+                  assert not name.startswith('tests/'), f'Stray test file packaged: {name}'
+                  assert not name.startswith('audit_reports/'), f'Stray audit file packaged: {name}'
+          print('Wheel packaging cleanliness verified!')
+          "
+
+      - name: Install wheel into isolated virtualenv and run smoke test
+        run: |
+          python -m venv test_env
+          ./test_env/bin/pip install --no-index dist/*.whl
+          ./test_env/bin/python -c "
+          import horaa_tls
+          from horaa_tls import Session, ClientProfile, Response, BackendError, Protocol
+          print('Import horaa_tls SUCCESS, version:', horaa_tls.__version__)
+          s = Session(profile=ClientProfile.CHROME_120)
+          assert s.profile == 'chrome_120'
+          assert s.force_http1 is False
+          assert s.timeout_seconds == 30
+          print('Clean isolated environment smoke test PASSED!')
+          "

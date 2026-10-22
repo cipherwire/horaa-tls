@@ -64,6 +64,7 @@ class TestResolutionOrder:
 
         monkeypatch.delenv("TLS_LIBRARY_PATH", raising=False)
         monkeypatch.setenv("HORAA_TLS_CACHE_DIR", str(deps))
+        monkeypatch.setattr(updater, "verify_cached_library", lambda path: True)
 
         def explode(*a, **kw):  # any network attempt fails the test
             raise AssertionError("network access attempted despite cached library")
@@ -124,3 +125,24 @@ class TestResolutionOrder:
         monkeypatch.setenv("HORAA_TLS_CACHE_DIR", str(tmp_path / "custom"))
         assert updater.get_dependencies_dir() == str(tmp_path / "custom")
         assert os.path.isdir(tmp_path / "custom")
+
+
+    def test_verify_cached_library(self, tmp_path, monkeypatch):
+        asset_name = "test-lib.dll"
+        file_path = tmp_path / asset_name
+        file_path.write_bytes(b"secure binary content")
+        import hashlib
+        real_hash = hashlib.sha256(b"secure binary content").hexdigest()
+
+        monkeypatch.setattr(updater, "ASSET_SHA256", {asset_name: real_hash})
+
+        assert updater.verify_cached_library(str(file_path)) is True
+
+        # Corrupt the file
+        file_path.write_bytes(b"tampered content")
+        assert updater.verify_cached_library(str(file_path)) is False
+
+        # Untracked custom asset defaults to True
+        untracked = tmp_path / "untracked.dll"
+        untracked.write_bytes(b"custom")
+        assert updater.verify_cached_library(str(untracked)) is True

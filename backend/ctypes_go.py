@@ -35,7 +35,7 @@ class CtypesGoBackend:
                         lib.request.restype = ctypes.c_char_p
 
                         lib.freeMemory.argtypes = [ctypes.c_char_p]
-                        lib.freeMemory.restype = ctypes.c_char_p
+                        lib.freeMemory.restype = None
 
                         lib.getCookiesFromSession.argtypes = [ctypes.c_char_p]
                         lib.getCookiesFromSession.restype = ctypes.c_char_p

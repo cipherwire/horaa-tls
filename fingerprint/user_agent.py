@@ -235,3 +235,34 @@ class UserAgentGenerator:
     def get_pseudo_header_order_for_profile(cls, profile: str) -> list[str] | None:
         """Returns the HTTP/2 pseudo-header (":method" etc.) order for the profile."""
         return list(cls._resolve_profile_data(profile).get("pseudo_header_order", [])) or None
+
+    @classmethod
+    def align_client_hints(cls, headers: dict[str, str], user_agent: str | None = None) -> dict[str, str]:
+        ua = user_agent or headers.get("User-Agent") or headers.get("user-agent") or ""
+        ua_lower = ua.lower()
+
+        has_platform = any(k.lower() == "sec-ch-ua-platform" for k in headers)
+        if not has_platform:
+            return headers
+
+        platform_key = next((k for k in headers if k.lower() == "sec-ch-ua-platform"), "Sec-Ch-Ua-Platform")
+        mobile_key = next((k for k in headers if k.lower() == "sec-ch-ua-mobile"), "Sec-Ch-Ua-Mobile")
+
+        if "android" in ua_lower:
+            headers[platform_key] = '"Android"'
+            if mobile_key in headers:
+                headers[mobile_key] = "?1"
+        elif "macintosh" in ua_lower or "mac os x" in ua_lower:
+            headers[platform_key] = '"macOS"'
+            if mobile_key in headers:
+                headers[mobile_key] = "?0"
+        elif "linux" in ua_lower:
+            headers[platform_key] = '"Linux"'
+            if mobile_key in headers:
+                headers[mobile_key] = "?0"
+        elif "windows" in ua_lower:
+            headers[platform_key] = '"Windows"'
+            if mobile_key in headers:
+                headers[mobile_key] = "?0"
+
+        return headers

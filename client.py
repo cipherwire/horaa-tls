@@ -48,6 +48,9 @@ class Session:
         insecure_skip_verify: bool = False,
         random_tls_extension_order: bool = False,
         use_mitm_when_active: bool = False,
+        force_http1: bool = False,
+        with_protocol_racing: bool = False,
+        disable_http3: bool = False,
         cookies: dict[str, str] | None = None,
         timeout_seconds: float = 30,
     ):
@@ -67,6 +70,7 @@ class Session:
             use_mitm_when_active: Set to True to automatically route traffic through
                 local Charles/Fiddler proxies if detected active. Off by default so
                 production traffic is never silently hijacked by a local dev tool.
+            force_http1: Set to True to force HTTP/1.1 instead of negotiating HTTP/2.
             cookies: Initial cookie jar (name -> value).
             timeout_seconds: Default request timeout in seconds.
 
@@ -78,6 +82,9 @@ class Session:
         self.insecure_skip_verify = insecure_skip_verify
         self.random_tls_extension_order = random_tls_extension_order
         self.use_mitm_when_active = use_mitm_when_active
+        self.force_http1 = force_http1
+        self.with_protocol_racing = with_protocol_racing
+        self.disable_http3 = disable_http3
 
         # Auto-detect local proxy if active and use_mitm_when_active is True
         self.proxy = proxy
@@ -131,12 +138,24 @@ class Session:
         self.redirect_middleware = RedirectMiddleware()
         self.middleware_pipeline.add(self.redirect_middleware)
 
+    @staticmethod
+    def _encode_params(params: Any) -> str:
+        """
+        Encodes query parameters, supporting dicts, lists of 2-tuples, and sequences.
+        Uses doseq=True so list values serialize as multiple parameters (e.g. tag=a&tag=b).
+        """
+        if isinstance(params, (str, bytes)):
+            return params.decode("utf-8") if isinstance(params, bytes) else params
+        if isinstance(params, (dict, list, tuple)):
+            return urllib.parse.urlencode(params, doseq=True)
+        return str(params)
+
     def _prepare_payload(
         self,
         method: str,
         url: str,
-        params: dict[str, Any] | None = None,
-        data: str | bytes | dict[str, Any] | None = None,
+        params: Any | None = None,
+        data: str | bytes | dict[str, Any] | list[tuple[str, Any]] | None = None,
         json_data: Any | None = None,
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
@@ -144,15 +163,21 @@ class Session:
         timeout: int | None = None,
         allow_redirects: bool = True,
         is_byte_response: bool = True,
+        stream_output_path: str | None = None,
+        stream_output_block_size: int | None = None,
     ) -> dict[str, Any]:
         """Constructs the JSON request payload expected by the Go shared library FFI."""
         # 1. Format URL with query parameters
-        if params:
-            url_parts = list(urllib.parse.urlparse(url))
-            query = dict(urllib.parse.parse_qsl(url_parts[4]))
-            query.update(params)
-            url_parts[4] = urllib.parse.urlencode(query)
-            url = urllib.parse.urlunparse(url_parts)
+        if params is not None:
+            enc_params = self._encode_params(params)
+            if enc_params:
+                url_parts = list(urllib.parse.urlsplit(url))
+                existing_query = url_parts[3]
+                if existing_query:
+                    url_parts[3] = f"{existing_query}&{enc_params}"
+                else:
+                    url_parts[3] = enc_params
+                url = urllib.parse.urlunsplit(url_parts)
 
         # 2. Merge headers (case-insensitive)
         merged_headers = {k.lower(): v for k, v in self.headers.items()}
@@ -176,8 +201,8 @@ class Session:
             if isinstance(data, (bytes, bytearray)):
                 request_body = base64.b64encode(data).decode("utf-8")
                 is_byte_request = True
-            elif isinstance(data, dict):
-                request_body = urllib.parse.urlencode(data)
+            elif isinstance(data, (dict, list, tuple)):
+                request_body = urllib.parse.urlencode(data, doseq=True)
                 content_type = "application/x-www-form-urlencoded"
             else:
                 request_body = str(data)
@@ -190,7 +215,7 @@ class Session:
         if cookies:
             merged_cookies.update(cookies)
 
-        target_host = urllib.parse.urlparse(url).netloc.lower()
+        target_host = (urllib.parse.urlparse(url).hostname or "").lower()
         request_cookies = []
         for name, value in merged_cookies.items():
             cookie_host = self._cookie_domains.get(name, "")
@@ -201,6 +226,15 @@ class Session:
             )
 
         # 5. Build payload
+        target_proxy = proxy or self.proxy
+        if self.with_protocol_racing and target_proxy:
+            parsed_p = urllib.parse.urlsplit(target_proxy)
+            if parsed_p.scheme.lower() not in ('socks5', 'socks5h'):
+                raise BackendError(
+                    f"Protocol racing requires a SOCKS5 proxy for HTTP/3 support. "
+                    f"Proxy '{target_proxy}' uses scheme '{parsed_p.scheme}', which only supports TCP and cannot tunnel QUIC/UDP traffic."
+                )
+
         payload = {
             "sessionId": self.session_id,
             "tlsClientIdentifier": self.profile,
@@ -217,6 +251,9 @@ class Session:
             "timeoutSeconds": int(timeout if timeout is not None else self.timeout_seconds),
             "followRedirects": allow_redirects,
             "insecureSkipVerify": self.insecure_skip_verify,
+            "forceHttp1": self.force_http1,
+            "withProtocolRacing": self.with_protocol_racing,
+            "disableHttp3": self.disable_http3,
             "withRandomTLSExtensionOrder": self.random_tls_extension_order,
         }
 
@@ -226,6 +263,11 @@ class Session:
         if self.pseudo_header_order:
             payload["pseudoHeaderOrder"] = self.pseudo_header_order
 
+        if stream_output_path:
+            payload["streamOutputPath"] = stream_output_path
+        if stream_output_block_size:
+            payload["streamOutputBlockSize"] = stream_output_block_size
+
         return payload
 
     @staticmethod
@@ -233,13 +275,13 @@ class Session:
         """Cookie host matching: exact match, or target is a subdomain of the cookie host."""
         if not cookie_host or not target_host:
             return True
-        cookie_host = cookie_host.lstrip(".").lower()
-        target_host = target_host.lower()
+        cookie_host = cookie_host.split(":")[0].lstrip(".").lower()
+        target_host = target_host.split(":")[0].lower()
         return target_host == cookie_host or target_host.endswith("." + cookie_host)
 
     def _filter_request_cookies(self, cookies: list[dict[str, Any]], url: str) -> list[dict[str, Any]]:
         """Filters an existing requestCookies list against the target URL's host."""
-        target_host = urllib.parse.urlparse(url).netloc.lower()
+        target_host = (urllib.parse.urlparse(url).hostname or "").lower()
         filtered = []
         for cookie in cookies:
             cookie_host = self._cookie_domains.get(cookie.get("name", ""), "")
@@ -252,7 +294,7 @@ class Session:
         """Syncs the cookies returned by the request back to the session cookies state,
         remembering which host set each cookie so they are never leaked cross-site."""
         if response.cookies:
-            host = urllib.parse.urlparse(response.url).netloc.lower()
+            host = (urllib.parse.urlparse(response.url).hostname or "").lower()
             for name, value in response.cookies.items():
                 self.cookies[name] = value
                 if host:
@@ -262,14 +304,16 @@ class Session:
         self,
         method: str,
         url: str,
-        params: dict[str, Any] | None = None,
-        data: str | bytes | dict[str, Any] | None = None,
+        params: Any | None = None,
+        data: str | bytes | dict[str, Any] | list[tuple[str, Any]] | None = None,
         json: Any | None = None,
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
         proxy: str | None = None,
         timeout: int | None = None,
         allow_redirects: bool = True,
+        stream_output_path: str | None = None,
+        stream_output_block_size: int | None = None,
     ) -> Response:
         """Executes a request synchronously running through the pluggable middleware pipeline."""
         self._ensure_open()
@@ -287,6 +331,8 @@ class Session:
             timeout=timeout,
             allow_redirects=allow_redirects,
             is_byte_response=is_byte_response,
+            stream_output_path=stream_output_path,
+            stream_output_block_size=stream_output_block_size,
         )
 
         # Run before_request middleware pipeline hooks
@@ -330,14 +376,16 @@ class Session:
         self,
         method: str,
         url: str,
-        params: dict[str, Any] | None = None,
-        data: str | bytes | dict[str, Any] | None = None,
+        params: Any | None = None,
+        data: str | bytes | dict[str, Any] | list[tuple[str, Any]] | None = None,
         json: Any | None = None,
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
         proxy: str | None = None,
         timeout: int | None = None,
         allow_redirects: bool = True,
+        stream_output_path: str | None = None,
+        stream_output_block_size: int | None = None,
     ) -> Response:
         """Executes a request asynchronously running through the pluggable middleware pipeline."""
         self._ensure_open()
@@ -355,6 +403,8 @@ class Session:
             timeout=timeout,
             allow_redirects=allow_redirects,
             is_byte_response=is_byte_response,
+            stream_output_path=stream_output_path,
+            stream_output_block_size=stream_output_block_size,
         )
 
         # Run before_request middleware pipeline hooks
@@ -446,7 +496,7 @@ class Session:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.close()
+        await self.close_async()
 
     def get_cookies_from_backend(self, url: str) -> list[dict[str, Any]]:
         """Queries the Go memory layer for current active cookies on the specified URL."""
@@ -467,6 +517,11 @@ class Session:
             logger.warning("Failed to destroy session %s: %s", self.session_id, e)
             return False
 
+    async def close_async(self) -> bool:
+        """Destroys the session connection pool and memory asynchronously. Idempotent."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.close)
+
     def to_dict(self) -> dict[str, Any]:
         """
         Serializes the session state into a dictionary.
@@ -478,6 +533,9 @@ class Session:
             "insecure_skip_verify": self.insecure_skip_verify,
             "random_tls_extension_order": self.random_tls_extension_order,
             "use_mitm_when_active": self.use_mitm_when_active,
+            "force_http1": self.force_http1,
+            "with_protocol_racing": self.with_protocol_racing,
+            "disable_http3": self.disable_http3,
             "cookies": self.cookies,
             "cookie_domains": self._cookie_domains,
             "timeout_seconds": self.timeout_seconds,
@@ -530,6 +588,9 @@ class Session:
         session._cookie_domains = data.get("cookie_domains", {})
         session.timeout_seconds = data.get("timeout_seconds", 30)
         session.random_tls_extension_order = data.get("random_tls_extension_order", False)
+        session.force_http1 = data.get("force_http1", False)
+        session.with_protocol_racing = data.get("with_protocol_racing", False)
+        session.disable_http3 = data.get("disable_http3", False)
         session.redirect_stop_at = data.get("redirect_stop_at")
         session.redirect_stop_if_contains = data.get("redirect_stop_if_contains")
 

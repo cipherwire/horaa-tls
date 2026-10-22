@@ -29,7 +29,10 @@ import os
 import platform
 import sys
 import threading
+import time
+import urllib.parse
 import urllib.request
+import uuid
 
 from horaa_tls.exceptions import BackendError
 from horaa_tls.log import logger
@@ -211,14 +214,14 @@ def save_local_version(asset_name: str, version: str):
 def _http_get(url: str, timeout: int) -> urllib.request.Request:
     headers = {"User-Agent": "horaa-tls-updater", "Accept": "application/octet-stream"}
     token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
-    if token and "api.github.com" in url:
+    if token and urllib.parse.urlparse(url).hostname == "api.github.com":
         headers["Authorization"] = f"token {token}"
     return urllib.request.Request(url, headers=headers)
 
 
 def download_asset(url: str, dest_path: str, expected_sha256: str | None = None):
     """Streams the file from ``url`` to ``dest_path`` atomically, verifying SHA-256 when known."""
-    tmp_path = dest_path + ".tmp"
+    tmp_path = f"{dest_path}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
     hasher = hashlib.sha256()
     try:
         with urllib.request.urlopen(_http_get(url, _DOWNLOAD_TIMEOUT), timeout=_DOWNLOAD_TIMEOUT) as response, open(tmp_path, "wb") as out_file:
@@ -272,16 +275,16 @@ def _fetch_release_payload(version: str | None) -> dict:
     urls.append(RELEASES_API_URL + "/latest")
 
     last_error: Exception | None = None
+    token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
     for url in urls:
         try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "horaa-tls-updater",
-                    "Accept": "application/vnd.github.v3+json",
-                    **({"Authorization": f"token {t}"} if (t := os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")) else {}),
-                },
-            )
+            headers = {
+                "User-Agent": "horaa-tls-updater",
+                "Accept": "application/vnd.github.v3+json",
+            }
+            if token and urllib.parse.urlparse(url).hostname == "api.github.com":
+                headers["Authorization"] = f"token {token}"
+            req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as response:
                 return json.loads(response.read().decode("utf-8"))
         except Exception as e:
@@ -325,6 +328,57 @@ def _resolve_via_api(deps_dir: str, version: str, candidate_names: list[str]) ->
 # Main entry point
 # ---------------------------------------------------------------------------
 
+
+class _ProcessLock:
+    """Inter-process file lock using atomic OS file creation with stale lock recovery."""
+
+    def __init__(self, lock_path: str, timeout: float = 300.0, poll_interval: float = 0.1):
+        self.lock_path = lock_path
+        self.timeout = timeout
+        self.poll_interval = poll_interval
+        self._fd: int | None = None
+
+    def __enter__(self):
+        start = time.time()
+        while True:
+            try:
+                self._fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                try:
+                    pl = f"{os.getpid()} {time.time()}".encode()
+                    os.write(self._fd, pl)
+                except Exception:
+                    pass
+                return self
+            except (FileExistsError, PermissionError):
+                try:
+                    st = os.stat(self.lock_path)
+                    if time.time() - st.st_mtime > self.timeout:
+                        try:
+                            os.remove(self.lock_path)
+                            continue
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+                if time.time() - start > self.timeout:
+                    raise BackendError(f"Timed out waiting for inter-process install lock {self.lock_path}")
+                time.sleep(self.poll_interval)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+        for _ in range(10):
+            try:
+                if os.path.exists(self.lock_path):
+                    os.remove(self.lock_path)
+                break
+            except OSError:
+                time.sleep(0.02)
+
 def update_if_necessary() -> str:
     """
     Checks if the shared library needs downloading or updating, and returns the
@@ -336,17 +390,48 @@ def update_if_necessary() -> str:
     if env_path and os.path.exists(env_path):
         return env_path
 
+    deps_dir = get_dependencies_dir()
+    lock_file = os.path.join(deps_dir, ".install.lock")
+
     with _update_lock:
-        return _update_locked()
+        with _ProcessLock(lock_file):
+            return _update_locked()
+
+
+def verify_cached_library(path: str) -> bool:
+    """
+    Verifies that an on-disk library matches its known SHA-256 checksum from ASSET_SHA256.
+    Returns True if valid, False if mismatch, True if untracked custom version.
+    """
+    asset_name = os.path.basename(path)
+    expected = ASSET_SHA256.get(asset_name)
+    if not expected:
+        return True
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest().lower() == expected.lower()
 
 
 def _update_locked() -> str:
     deps_dir = get_dependencies_dir()
+    skip_verify = os.getenv("HORAA_TLS_SKIP_CACHE_VERIFY", "").lower() in ("1", "true", "yes")
 
-    # 2. Trust the cache marker: no network calls for repeat sessions.
+    # 2. Trust the cache marker: verify integrity by default before returning.
     local_asset, _local_version = read_local_version()
     if local_asset and os.path.exists(os.path.join(deps_dir, local_asset)):
-        return os.path.join(deps_dir, local_asset)
+        cached_path = os.path.join(deps_dir, local_asset)
+        if not skip_verify:
+            if not verify_cached_library(cached_path):
+                raise BackendError(
+                    f"Cached library {local_asset} failed SHA-256 verification. "
+                    "Refusing to load a potentially tampered binary."
+                )
+        return cached_path
 
     version = os.getenv("HORAA_TLS_TLS_CLIENT_VERSION") or DEFAULT_TLS_CLIENT_VERSION
     candidate_names = generate_asset_names(version)
@@ -355,6 +440,12 @@ def _update_locked() -> str:
     for name in candidate_names:
         path = os.path.join(deps_dir, name)
         if os.path.exists(path):
+            if not skip_verify:
+                if not verify_cached_library(path):
+                    raise BackendError(
+                        f"Existing library {name} failed SHA-256 verification. "
+                        "Refusing to load a potentially tampered binary."
+                    )
             save_local_version(name, version)
             return path
 

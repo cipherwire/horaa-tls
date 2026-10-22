@@ -80,13 +80,13 @@ class ProxyRotatorMiddleware(BaseMiddleware):
         if not self.proxies:
             return
 
-        # If rotating per request, cycle the index
-        if self.mode == "request":
-            self._rotate()
-
         # Inject proxy into payload
         current_proxy = self._get_current_proxy()
         payload["proxyUrl"] = current_proxy
+
+        # If rotating per request, cycle the index
+        if self.mode == "request":
+            self._rotate()
 
     def after_response(
         self, session, payload: dict[str, Any], response: Response

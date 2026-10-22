@@ -1,5 +1,6 @@
 import base64
 import json
+from collections.abc import Mapping
 from enum import Enum
 from typing import Any, Optional
 
@@ -24,6 +25,7 @@ class CaseInsensitiveDict(dict):
     def __init__(self, data=None, **kwargs):
         super().__init__()
         self._store: dict[str, tuple] = {}
+        self._list_store: dict[str, list[Any]] = {}
         if data:
             self.update(data)
         if kwargs:
@@ -45,9 +47,14 @@ class CaseInsensitiveDict(dict):
         else:
             super().__setitem__(key, value)
         self._store[lc] = (cased_key, value)
+        if isinstance(value, list):
+            self._list_store[lc] = list(value)
+        else:
+            self._list_store[lc] = [value]
 
     def _forget(self, key: str):
         lc = self._lower(key)
+        self._list_store.pop(lc, None)
         entry = self._store.pop(lc, None)
         if entry:
             super().__delitem__(entry[0])
@@ -81,6 +88,11 @@ class CaseInsensitiveDict(dict):
         self[key] = default
         return default
 
+    def popitem(self) -> tuple[str, Any]:
+        cased_key, value = super().popitem()
+        self._store.pop(self._lower(cased_key), None)
+        return cased_key, value
+
     def pop(self, key: str, *default):
         try:
             value = self[key]
@@ -111,13 +123,25 @@ class CaseInsensitiveDict(dict):
     def copy(self):
         return CaseInsensitiveDict(dict(super().items()))
 
+    def getlist(self, key: str, default: Any = None) -> list[Any]:
+        """
+        Returns all values for the header key as a list.
+        Standard for multi-valued headers such as Set-Cookie.
+        """
+        lc = self._lower(key)
+        if lc in self._list_store:
+            return list(self._list_store[lc])
+        return default if default is not None else []
+
+    get_all = getlist
+
     # -- equality -------------------------------------------------------------
 
     def __eq__(self, other) -> bool:
         if isinstance(other, CaseInsensitiveDict):
-            return {k: v for k, v in self.items()} == {k: v for k, v in other.items()}
-        if isinstance(other, dict):
-            return dict(super().items()) == other
+            return {k: v[1] for k, v in self._store.items()} == {k: v[1] for k, v in other._store.items()}
+        if isinstance(other, (dict, Mapping)):
+            return {k: v[1] for k, v in self._store.items()} == {k: v[1] for k, v in CaseInsensitiveDict(other)._store.items()}
         return NotImplemented
 
     def __ne__(self, other) -> bool:
@@ -222,6 +246,71 @@ class Response:
         """True when the response is a 3xx carrying a Location header."""
         return self.status_code in (301, 302, 303, 307, 308) and "location" in self.headers
 
+    @property
+    def protocol(self) -> Protocol | None:
+        """Returns the negotiated HTTP protocol enum (HTTP_1_1, HTTP_2, HTTP_3)."""
+        return self.used_protocol
+
+    def iter_content(self, chunk_size: int = 128, decode_unicode: bool = False):
+        """
+        Iterates over the response body in chunks.
+        """
+        if chunk_size is not None and chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer or None")
+
+        data = self.text if decode_unicode else self.content
+        if not data:
+            return
+
+        if chunk_size is None:
+            yield data
+            return
+
+        length = len(data)
+        for i in range(0, length, chunk_size):
+            yield data[i:i + chunk_size]
+
+    def iter_lines(self, chunk_size: int = 512, decode_unicode: bool | None = None, delimiter: str | bytes | None = None):
+        """
+        Iterates over the response body, one line at a time.
+        When decode_unicode is True (or default), yields strings; otherwise bytes.
+        """
+        if decode_unicode is None:
+            decode_unicode = True
+
+        pending = "" if decode_unicode else b""
+        delims = [delimiter] if delimiter else (["\r\n", "\n", "\r"] if decode_unicode else [b"\r\n", b"\n", b"\r"])
+
+        for chunk in self.iter_content(chunk_size=chunk_size, decode_unicode=decode_unicode):
+            pending += chunk
+            while True:
+                earliest_idx = -1
+                matched_delim = None
+                for d in delims:
+                    idx = pending.find(d)
+                    if idx != -1 and (earliest_idx == -1 or idx < earliest_idx):
+                        earliest_idx = idx
+                        matched_delim = d
+
+                if earliest_idx != -1 and matched_delim is not None:
+                    line = pending[:earliest_idx]
+                    pending = pending[earliest_idx + len(matched_delim):]
+                    yield line
+                else:
+                    break
+        if pending:
+            yield pending
+
+    def close(self) -> None:
+        """Releases response resources (idempotent, conforms to requests/httpx API)."""
+        pass
+
+    def __enter__(self) -> 'Response':
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
     def __repr__(self) -> str:
         return f"<Response [{self.status_code}]>"
 
@@ -244,11 +333,13 @@ def build_response(raw_resp: dict[str, Any], is_byte_response: bool = False) -> 
     headers_dict = CaseInsensitiveDict()
     raw_headers = raw_resp.get("headers", {})
     for key, values in raw_headers.items():
-        # Go tls-client headers return values as a list. We join or pick the first one.
+        # Go tls-client headers return values as a list.
         if isinstance(values, list):
             headers_dict[key] = values[0] if len(values) == 1 else ", ".join(values)
+            headers_dict._list_store[key.lower()] = list(values)
         else:
             headers_dict[key] = str(values)
+            headers_dict._list_store[key.lower()] = [str(values)]
     response.headers = headers_dict
 
     # Map body content
