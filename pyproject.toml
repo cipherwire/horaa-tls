@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "horaa-tls"
+version = "0.2.0"
+description = "Advanced HTTP client with low-level TLS and browser fingerprint spoofing based on Go tls-client FFI"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Amit Haina" }
+]
+keywords = ["tls", "http-client", "fingerprint", "anti-bot", "ja3", "ja4", "impersonation"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/AmitHaina/horaa-tls"
+Repository = "https://github.com/AmitHaina/horaa-tls"
+Issues = "https://github.com/AmitHaina/horaa-tls/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+]
+
+[tool.setuptools]
+packages = [
+    "horaa_tls",
+    "horaa_tls.backend",
+    "horaa_tls.fingerprint",
+    "horaa_tls.middleware",
+    "horaa_tls.utils"
+]
+
+[tool.setuptools.package-dir]
+"horaa_tls" = "."
+"horaa_tls.backend" = "backend"
+"horaa_tls.fingerprint" = "fingerprint"
+"horaa_tls.middleware" = "middleware"
+"horaa_tls.utils" = "utils"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]
