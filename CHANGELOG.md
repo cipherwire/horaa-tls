@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/cipherwire/horaa-tls/compare/v0.2.0...v0.3.0) (2026-10-22)
+
+
+### Features
+
+* complete release engineering, automated versioning, http3 racing, and security hardening ([62c399f](https://github.com/cipherwire/horaa-tls/commit/62c399f3643285368dfffe1f9f534d410bae08d4))
+
+
+### Bug Fixes
+
+* synchronize dynamic __version__ fallback with pyproject.toml ([9e069a2](https://github.com/cipherwire/horaa-tls/commit/9e069a20cf661a2bdc1a18c130f849cdef1e0626))
+
 ## 0.2.0 — 2026-09-05
 
 ### Fixed
