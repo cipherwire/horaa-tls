@@ -175,10 +175,15 @@ jobs:
           name: release-dist
           path: dist
 
+      - name: Prepare PyPI Packages Directory
+        run: |
+          mkdir -p pypi-dist
+          cp dist/*.whl dist/*.tar.gz pypi-dist/ 2>/dev/null || true
+
       - name: Publish Distribution to PyPI
         uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.12.4
         with:
-          packages-dir: dist/
+          packages-dir: pypi-dist/
           print-hash: true
           password: ${{ secrets.PYPI_API_TOKEN }}
           skip-existing: true
