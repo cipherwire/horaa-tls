@@ -161,6 +161,7 @@ jobs:
   publish-pypi:
     name: Publish to PyPI (OIDC Trusted Publishing)
     needs: [build-and-verify]
+    if: always() && needs.build-and-verify.result == 'success'
     runs-on: ubuntu-latest
     environment:
       name: pypi
