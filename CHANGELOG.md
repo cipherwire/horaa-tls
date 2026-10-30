@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/cipherwire/horaa-tls/compare/v0.3.0...v0.3.1) (2026-10-30)
+
+
+### Bug Fixes
+
+* resolve cookie expiration sync, subsecond timeouts, session finalizer, and hot-path optimizations ([55ab033](https://github.com/cipherwire/horaa-tls/commit/55ab033d6c8f790e5d1b98818b6a86d0aef8fb1b))
+
 ## [0.3.0](https://github.com/cipherwire/horaa-tls/compare/v0.2.0...v0.3.0) (2026-10-22)
 
 
