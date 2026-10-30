@@ -189,3 +189,19 @@ class TestResponseExtensions:
             assert resp.status_code == 200
             assert resp.text == 'ok'
         resp.close()
+
+
+    def test_response_json_memoization(self):
+        r = build_response({"status": 200, "headers": {}, "body": '{"count": 1}'}, is_byte_response=False)
+        first = r.json()
+        second = r.json()
+        assert first == {"count": 1}
+        assert first is second
+
+    def test_case_insensitive_dict_load_backend_headers(self):
+        d = CaseInsensitiveDict()
+        d.load_backend_headers({"X-Header": ["val1", "val2"], "Single": "one"})
+        assert d["x-header"] == "val1, val2"
+        assert d.getlist("X-Header") == ["val1", "val2"]
+        assert d["single"] == "one"
+        assert d.getlist("single") == ["one"]

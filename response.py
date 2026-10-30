@@ -2,6 +2,7 @@ import base64
 import json
 from collections.abc import Mapping
 from enum import Enum
+from http.cookies import SimpleCookie
 from typing import Any, Optional
 
 from horaa_tls.exceptions import NetworkError
@@ -105,6 +106,20 @@ class CaseInsensitiveDict(dict):
 
     # -- dict-compatible bulk operations -------------------------------------
 
+    def load_backend_headers(self, raw_headers: dict[str, Any]) -> None:
+        """Optimized one-pass bulk loader for raw Go response headers."""
+        for key, values in raw_headers.items():
+            lc = self._lower(key)
+            if isinstance(values, list):
+                val_str = values[0] if len(values) == 1 else ", ".join(values)
+                val_list = list(values)
+            else:
+                val_str = str(values)
+                val_list = [val_str]
+            super().__setitem__(key, val_str)
+            self._store[lc] = (key, val_str)
+            self._list_store[lc] = val_list
+
     def update(self, other=None, **kwargs):
         if other:
             if hasattr(other, "keys"):
@@ -192,6 +207,7 @@ class Response:
 
         self._content: bytes = b""
         self._text: str | None = None
+        self._json_cache: Any | None = None
 
     @property
     def content(self) -> bytes:
@@ -225,11 +241,16 @@ class Response:
         return self._text
 
     def json(self, **kwargs) -> Any:
-        """Parses the response body as JSON (tolerates a leading BOM)."""
+        """Parses the response body as JSON (tolerates a leading BOM). Memoized when called without kwargs."""
+        if not kwargs and self._json_cache is not None:
+            return self._json_cache
         text = self.text
         if text.startswith("\ufeff"):
             text = text.lstrip("\ufeff")
-        return json.loads(text, **kwargs)
+        parsed = json.loads(text, **kwargs)
+        if not kwargs:
+            self._json_cache = parsed
+        return parsed
 
     def raise_for_status(self):
         """Raises a NetworkError if HTTP status code represents a client or server error."""
@@ -329,17 +350,9 @@ def build_response(raw_resp: dict[str, Any], is_byte_response: bool = False) -> 
     response.status_code = raw_resp.get("status", 0)
     response.used_protocol = Protocol.from_string(raw_resp.get("usedProtocol"))
 
-    # Map headers to CaseInsensitiveDict
+    # Map headers to CaseInsensitiveDict via single-pass bulk loader
     headers_dict = CaseInsensitiveDict()
-    raw_headers = raw_resp.get("headers", {})
-    for key, values in raw_headers.items():
-        # Go tls-client headers return values as a list.
-        if isinstance(values, list):
-            headers_dict[key] = values[0] if len(values) == 1 else ", ".join(values)
-            headers_dict._list_store[key.lower()] = list(values)
-        else:
-            headers_dict[key] = str(values)
-            headers_dict._list_store[key.lower()] = [str(values)]
+    headers_dict.load_backend_headers(raw_resp.get("headers", {}))
     response.headers = headers_dict
 
     # Map body content
@@ -348,12 +361,12 @@ def build_response(raw_resp: dict[str, Any], is_byte_response: bool = False) -> 
         if raw_body.startswith("data:") and "," in raw_body:
             base64_str = raw_body.split(",", 1)[1]
             try:
-                response._content = base64.b64decode(base64_str, validate=True)
+                response._content = base64.b64decode(base64_str, validate=False)
             except Exception:
                 response._content = raw_body.encode("utf-8")
         else:
             try:
-                response._content = base64.b64decode(raw_body, validate=True)
+                response._content = base64.b64decode(raw_body, validate=False)
             except Exception:
                 response._content = raw_body.encode("utf-8")
     else:
@@ -367,5 +380,26 @@ def build_response(raw_resp: dict[str, Any], is_byte_response: bool = False) -> 
         for cookie in raw_cookies:
             if isinstance(cookie, dict) and "name" in cookie and "value" in cookie:
                 response.cookies[cookie["name"]] = cookie["value"]
+
+    # Fallback: Parse Set-Cookie response headers to ensure non-standard or IP-domain
+    # cookies (omitted by Go's RFC 6265 strict jar) are preserved in response.cookies.
+    set_cookie_headers = response.headers.getlist("set-cookie") if hasattr(response.headers, "getlist") else []
+    if set_cookie_headers:
+        for header_val in set_cookie_headers:
+            try:
+                sc = SimpleCookie()
+                sc.load(header_val)
+                for cookie_name, morsel in sc.items():
+                    max_age = morsel.get("max-age")
+                    if max_age:
+                        try:
+                            if int(max_age) <= 0:
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+                    if cookie_name not in response.cookies and morsel.value:
+                        response.cookies[cookie_name] = morsel.value
+            except Exception:
+                pass
 
     return response

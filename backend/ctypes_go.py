@@ -125,7 +125,8 @@ class CtypesGoBackend:
         """Wrapper around the ctypes C call to request and free memory in Go."""
         lib = self.get_library()
         # Clean request payload by removing private keys starting with '_' (used for Python middleware state)
-        clean_payload = {k: v for k, v in request_payload.items() if not k.startswith("_")}
+        has_private = any(k.startswith("_") for k in request_payload)
+        clean_payload = {k: v for k, v in request_payload.items() if not k.startswith("_")} if has_private else request_payload
         payload_bytes = json.dumps(clean_payload).encode("utf-8")
 
         response_ptr = lib.request(payload_bytes)

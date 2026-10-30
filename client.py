@@ -1,9 +1,11 @@
 import asyncio
 import base64
+import email.utils
 import time
 import urllib.parse
 import uuid
 from enum import Enum
+from http.cookies import SimpleCookie
 from typing import Any
 
 from horaa_tls.backend.ctypes_go import CtypesGoBackend
@@ -108,6 +110,8 @@ class Session:
         self.redirect_stop_if_contains: str | None = None
 
         self.headers = UserAgentGenerator.generate_headers_for_profile(self.profile)
+        self._headers_cache_id = id(self.headers)
+        self._base_headers_lower = {k.lower(): v for k, v in self.headers.items()}
         self.cookies: dict[str, str] = dict(cookies) if cookies else {}
         # Tracks which host set each cookie (cookie name -> host), so cookies
         # received from site A are never replayed to site B.
@@ -160,7 +164,7 @@ class Session:
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
         proxy: str | None = None,
-        timeout: int | None = None,
+        timeout: float | int | None = None,
         allow_redirects: bool = True,
         is_byte_response: bool = True,
         stream_output_path: str | None = None,
@@ -179,14 +183,22 @@ class Session:
                     url_parts[3] = enc_params
                 url = urllib.parse.urlunsplit(url_parts)
 
-        # 2. Merge headers (case-insensitive)
-        merged_headers = {k.lower(): v for k, v in self.headers.items()}
+        # 2. Merge headers (case-insensitive with fast cached base)
+        if getattr(self, "_headers_cache_id", None) != id(self.headers):
+            self._headers_cache_id = id(self.headers)
+            self._base_headers_lower = {k.lower(): v for k, v in self.headers.items()}
+        merged_headers = self._base_headers_lower.copy()
         if headers:
             for k, v in headers.items():
+                k_lower = k.lower()
                 if v is None:
-                    merged_headers.pop(k.lower(), None)
+                    if k_lower == "user-agent":
+                        # Set to empty string to suppress Go's default "Go-http-client/1.1" fallback
+                        merged_headers["user-agent"] = ""
+                    else:
+                        merged_headers.pop(k_lower, None)
                 else:
-                    merged_headers[k.lower()] = v
+                    merged_headers[k_lower] = v
 
         # 3. Format request body
         request_body = ""
@@ -246,9 +258,10 @@ class Session:
             "headers": merged_headers,
             "requestCookies": request_cookies,
             "proxyUrl": proxy or self.proxy or "",
-            # Go's RequestInput.timeoutSeconds is an int; keep ints as ints
-            # (a float like 30.0 fails Go's JSON unmarshalling).
-            "timeoutSeconds": int(timeout if timeout is not None else self.timeout_seconds),
+            # Timeout precision: Go tls-client accepts either timeoutSeconds (int)
+            # or timeoutMilliseconds (int). For sub-second or fractional timeouts,
+            # use timeoutMilliseconds to prevent truncation to 0 (which disables timeout).
+            **self._resolve_timeout_payload(timeout),
             "followRedirects": allow_redirects,
             "insecureSkipVerify": self.insecure_skip_verify,
             "forceHttp1": self.force_http1,
@@ -270,13 +283,30 @@ class Session:
 
         return payload
 
+    def _resolve_timeout_payload(self, timeout: float | int | None) -> dict[str, int]:
+        """Resolves timeout value into either timeoutSeconds or timeoutMilliseconds for Go FFI."""
+        val = timeout if timeout is not None else self.timeout_seconds
+        try:
+            fval = float(val)
+        except (ValueError, TypeError):
+            fval = 30.0
+
+        if fval <= 0:
+            return {"timeoutSeconds": 0}
+        # Use millisecond precision for fractional/sub-second durations
+        if (fval % 1 != 0) or (0 < fval < 1):
+            return {"timeoutMilliseconds": int(round(fval * 1000))}
+        return {"timeoutSeconds": int(fval)}
+
     @staticmethod
     def _host_matches(cookie_host: str, target_host: str) -> bool:
         """Cookie host matching: exact match, or target is a subdomain of the cookie host."""
         if not cookie_host or not target_host:
             return True
-        cookie_host = cookie_host.split(":")[0].lstrip(".").lower()
-        target_host = target_host.split(":")[0].lower()
+        if ":" in cookie_host or cookie_host.startswith("."):
+            cookie_host = cookie_host.split(":")[0].lstrip(".").lower()
+        if ":" in target_host:
+            target_host = target_host.split(":")[0].lower()
         return target_host == cookie_host or target_host.endswith("." + cookie_host)
 
     def _filter_request_cookies(self, cookies: list[dict[str, Any]], url: str) -> list[dict[str, Any]]:
@@ -292,7 +322,40 @@ class Session:
 
     def _sync_cookies(self, response: Response):
         """Syncs the cookies returned by the request back to the session cookies state,
-        remembering which host set each cookie so they are never leaked cross-site."""
+        remembering which host set each cookie so they are never leaked cross-site,
+        and purging cookies that were expired or deleted via Set-Cookie headers."""
+        # 1. Parse Set-Cookie headers for explicit deletion or expiration
+        set_cookie_headers = response.headers.getlist("set-cookie") if hasattr(response.headers, "getlist") else []
+        if set_cookie_headers:
+            now = time.time()
+            for header_val in set_cookie_headers:
+                try:
+                    sc = SimpleCookie()
+                    sc.load(header_val)
+                    for cookie_name, morsel in sc.items():
+                        is_expired = False
+                        max_age = morsel.get("max-age")
+                        if max_age:
+                            try:
+                                if int(max_age) <= 0:
+                                    is_expired = True
+                            except (ValueError, TypeError):
+                                pass
+                        expires = morsel.get("expires")
+                        if not is_expired and expires:
+                            try:
+                                exp_dt = email.utils.parsedate_to_datetime(expires)
+                                if exp_dt.timestamp() <= now:
+                                    is_expired = True
+                            except Exception:
+                                pass
+                        if is_expired:
+                            self.cookies.pop(cookie_name, None)
+                            self._cookie_domains.pop(cookie_name, None)
+                except Exception:
+                    pass
+
+        # 2. Update active cookies from response
         if response.cookies:
             host = (urllib.parse.urlparse(response.url).hostname or "").lower()
             for name, value in response.cookies.items():
@@ -310,7 +373,7 @@ class Session:
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
         proxy: str | None = None,
-        timeout: int | None = None,
+        timeout: float | int | None = None,
         allow_redirects: bool = True,
         stream_output_path: str | None = None,
         stream_output_block_size: int | None = None,
@@ -382,7 +445,7 @@ class Session:
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
         proxy: str | None = None,
-        timeout: int | None = None,
+        timeout: float | int | None = None,
         allow_redirects: bool = True,
         stream_output_path: str | None = None,
         stream_output_block_size: int | None = None,
@@ -516,6 +579,13 @@ class Session:
         except Exception as e:
             logger.warning("Failed to destroy session %s: %s", self.session_id, e)
             return False
+
+    def __del__(self) -> None:
+        """Finalizer to ensure native Go connection pool and memory are released if close() was omitted."""
+        try:
+            self.close()
+        except Exception:
+            pass
 
     async def close_async(self) -> bool:
         """Destroys the session connection pool and memory asynchronously. Idempotent."""
