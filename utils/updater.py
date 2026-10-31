@@ -371,6 +371,16 @@ class _ProcessLock:
             except OSError:
                 pass
             self._fd = None
+        # Only remove the lock file if it still records OUR pid. If our stale lock
+        # was recovered by another process (which rewrote the file with its own pid),
+        # deleting it would release the other process's lock while it still holds it.
+        try:
+            with open(self.lock_path) as f:
+                content = f.read().split(" ")[0]
+            if content != str(os.getpid()):
+                return
+        except OSError:
+            return
         for _ in range(10):
             try:
                 if os.path.exists(self.lock_path):

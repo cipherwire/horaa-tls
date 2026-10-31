@@ -53,15 +53,32 @@ def test_subsecond_timeout_resolution():
 
 
 def test_session_finalizer_garbage_collection():
-    """Verify Session.__del__ triggers close() and cleans up the Go backend session."""
+    """Verify Session.__del__ triggers close() and cleans up the Go backend session.
+
+    A session that never issued a request has no Go-side client: the finalizer must
+    skip the destroy FFI call (which would otherwise load the native library just to
+    free nothing). A session that issued a request must be destroyed exactly once.
+    """
+    # 1. Never-used session: finalizer must not call destroy.
     session = Session()
     mock_destroy = MagicMock(return_value=True)
     session.backend.destroy_session = mock_destroy
+    del session
+    gc.collect()
+    mock_destroy.assert_not_called()
 
+    # 2. Used session: finalizer must destroy the Go-side client exactly once.
+    session = Session()
+    mock_destroy = MagicMock(return_value=True)
+    session.backend.destroy_session = mock_destroy
+    session.backend.execute = lambda payload: {
+        "status": 200, "target": payload.get("requestUrl", ""),
+        "headers": {}, "body": "", "cookies": {},
+    }
+    session.get("https://example.com/")
     session_id = session.session_id
     del session
     gc.collect()
-
     mock_destroy.assert_called_once_with(session_id)
 
 

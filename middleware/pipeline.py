@@ -12,12 +12,25 @@ class MiddlewarePipeline:
     def __init__(self):
         self._middlewares: list[BaseMiddleware] = []
 
+    @staticmethod
+    def _validate_middleware(middleware) -> None:
+        """Rejects objects missing the middleware hook methods at registration time,
+        instead of failing later with an AttributeError mid-request."""
+        for hook in ("before_request", "after_response", "after_error"):
+            if not callable(getattr(middleware, hook, None)):
+                raise TypeError(
+                    f"Middleware {middleware!r} does not implement {hook}() "
+                    f"(subclass BaseMiddleware or provide all three hooks)"
+                )
+
     def add(self, middleware: BaseMiddleware):
         """Appends a middleware instance to the pipeline."""
+        self._validate_middleware(middleware)
         self._middlewares.append(middleware)
 
     def insert(self, index: int, middleware: BaseMiddleware):
         """Inserts a middleware instance at a specific position in the pipeline."""
+        self._validate_middleware(middleware)
         self._middlewares.insert(index, middleware)
 
     def execute_before(self, session, payload: dict[str, Any]) -> None:

@@ -25,10 +25,12 @@ except PackageNotFoundError:  # running from a source checkout
         import re
         from pathlib import Path
         _pyproj = Path(__file__).resolve().parent / "pyproject.toml"
-        _m = re.search(r'version\s*=\s*["\']([^"\']+)["\']', _pyproj.read_text(encoding="utf-8")) if _pyproj.exists() else None
-        __version__ = _m.group(1) if _m else "0.2.0"
+        _m = re.search(r'^version\s*=\s*["\']([^"\']+)["\']', _pyproj.read_text(encoding="utf-8"), re.M) if _pyproj.exists() else None
+        # Never guess a specific release here: a wrong hardcoded version silently
+        # masks the real one. "unknown" makes a broken install visible instead.
+        __version__ = _m.group(1) if _m else "0.0.0+unknown"
     except Exception:
-        __version__ = "0.2.0"
+        __version__ = "0.0.0+unknown"
 
 # Library best practice: never configure handlers, just silence
 # "No handlers could be found" noise unless the app opted in.

@@ -150,7 +150,8 @@ class CtypesGoBackend:
         lib = self.get_library()
         payload = json.dumps({"sessionId": session_id, "url": url}).encode("utf-8")
         res_obj = self._call(lib.getCookiesFromSession(payload), "get_cookies")
-        return res_obj.get("cookies", []) if res_obj else []
+        # Go sends an explicit JSON null when no client/cookies exist; never leak None.
+        return (res_obj.get("cookies") or []) if res_obj else []
 
     def add_cookies(self, session_id: str, url: str, cookies: list) -> list:
         """Add cookies into Go session memory for a given URL."""
@@ -161,7 +162,18 @@ class CtypesGoBackend:
             "cookies": cookies
         }).encode("utf-8")
         res_obj = self._call(lib.addCookiesToSession(payload), "add_cookies")
-        return res_obj.get("cookies", []) if res_obj else []
+        if not res_obj:
+            return []
+        stored = res_obj.get("cookies")
+        if stored is None:
+            # Go creates session clients lazily on the first request; until then it
+            # answers addCookiesToSession with body="no client found for sessionId".
+            # Never silently drop the caller's cookies: surface the failure.
+            body = res_obj.get("body")
+            if body:
+                raise BackendError(f"add_cookies failed: {body} (issue a request on this session first)")
+            return []
+        return stored
 
     def destroy_session(self, session_id: str) -> bool:
         """Destroys the session inside Go memory, releasing connections."""

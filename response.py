@@ -91,7 +91,9 @@ class CaseInsensitiveDict(dict):
 
     def popitem(self) -> tuple[str, Any]:
         cased_key, value = super().popitem()
-        self._store.pop(self._lower(cased_key), None)
+        lc = self._lower(cased_key)
+        self._list_store.pop(lc, None)
+        self._store.pop(lc, None)
         return cased_key, value
 
     def pop(self, key: str, *default):
@@ -134,9 +136,15 @@ class CaseInsensitiveDict(dict):
     def clear(self):
         super().clear()
         self._store.clear()
+        self._list_store.clear()
 
     def copy(self):
-        return CaseInsensitiveDict(dict(super().items()))
+        clone = CaseInsensitiveDict()
+        dict.update(clone, self)  # visible dict keeps last-set casing
+        clone._store = dict(self._store)
+        # Copy list contents so multi-valued headers (Set-Cookie etc.) survive the copy
+        clone._list_store = {k: list(v) for k, v in self._list_store.items()}
+        return clone
 
     def getlist(self, key: str, default: Any = None) -> list[Any]:
         """
@@ -184,7 +192,7 @@ class Protocol(Enum):
             return cls.HTTP_2
         if val in ("H1", "HTTP/1", "HTTP/1.1"):
             return cls.HTTP_1_1
-        if val in ("HTTP/3", "HTTP/3.0", "QUIC"):
+        if val in ("HTTP/3", "HTTP/3.0", "QUIC", "H3"):
             return cls.HTTP_3
 
         for member in cls:
@@ -208,6 +216,10 @@ class Response:
         self._content: bytes = b""
         self._text: str | None = None
         self._json_cache: Any | None = None
+        # Parsed Set-Cookie morsels from build_response (single-parse optimization).
+        # None for handcrafted Response objects; Session._sync_cookies falls back to
+        # parsing the raw headers when absent.
+        self._set_cookie_morsels: dict[str, Any] | None = None
 
     @property
     def content(self) -> bytes:
@@ -259,8 +271,8 @@ class Response:
 
     @property
     def ok(self) -> bool:
-        """True when the status code is below 400."""
-        return self.status_code < 400
+        """True when the status code is a real HTTP success or redirect (2xx/3xx)."""
+        return 200 <= self.status_code < 400
 
     @property
     def is_redirect(self) -> bool:
@@ -276,8 +288,9 @@ class Response:
         """
         Iterates over the response body in chunks.
         """
-        if chunk_size is not None and chunk_size <= 0:
-            raise ValueError("chunk_size must be a positive integer or None")
+        if chunk_size is not None:
+            if chunk_size <= 0 or int(chunk_size) != chunk_size:
+                raise ValueError("chunk_size must be a positive integer or None")
 
         data = self.text if decode_unicode else self.content
         if not data:
@@ -295,32 +308,89 @@ class Response:
         """
         Iterates over the response body, one line at a time.
         When decode_unicode is True (or default), yields strings; otherwise bytes.
+
+        Implementation notes (performance): a cursor marks the consumed prefix so the
+        remainder is copied once per chunk instead of once per line, and the default
+        delimiter set is scanned via single-character \\r/\\n finds with CRLF lookahead
+        (any "\\r\\n" match implies a single-char match at or before it). Failed
+        single-char scans are cached because the buffer only ever appends. Together
+        this keeps large-body streaming linear; the naive "find every delimiter from
+        index 0 per line" approach is O(n^2) (measured 65 s for a 4 MB / 50k-line body).
         """
         if decode_unicode is None:
             decode_unicode = True
 
         pending = "" if decode_unicode else b""
-        delims = [delimiter] if delimiter else (["\r\n", "\n", "\r"] if decode_unicode else [b"\r\n", b"\n", b"\r"])
+        cr = "\r" if decode_unicode else b"\r"
+        lf = "\n" if decode_unicode else b"\n"
+        if delimiter:
+            delims = [delimiter]
+            max_d = len(delimiter)
+        else:
+            delims = None  # default set handled by the single-char fast path
+            max_d = 2
+        pos = 0          # consumed boundary: pending[:pos] is fully emitted
+        search_from = 0  # find starts here (region before it is known delimiter-free)
+        absent = {cr: 0, lf: 0}  # a failed find(d) stays valid up to this index
 
-        for chunk in self.iter_content(chunk_size=chunk_size, decode_unicode=decode_unicode):
+        def find_next(buf, start):
+            """(index, delim_len) of the earliest line break at/after start.
+            delim_len -1 marks an ambiguous trailing CR (caller defers)."""
+            if delims is not None:
+                idx = buf.find(delims[0], start)
+                return (idx, len(delims[0])) if idx != -1 else (None, None)
+            i_r = buf.find(cr, max(start, absent[cr]))
+            if i_r == -1:
+                absent[cr] = len(buf)
+            i_n = buf.find(lf, max(start, absent[lf]))
+            if i_n == -1:
+                absent[lf] = len(buf)
+            if i_r == -1 and i_n == -1:
+                return None, None
+            if i_n == -1 or (i_r != -1 and i_r < i_n):
+                # CR matched first: it is CRLF iff an LF immediately follows
+                if i_r + 1 == len(buf):
+                    return i_r, -1
+                if buf[i_r + 1:i_r + 2] == lf:
+                    return i_r, 2
+                return i_r, 1
+            return i_n, 1
+
+        stream = self.iter_content(chunk_size=chunk_size, decode_unicode=decode_unicode)
+        for chunk in stream:
             pending += chunk
             while True:
-                earliest_idx = -1
-                matched_delim = None
-                for d in delims:
-                    idx = pending.find(d)
-                    if idx != -1 and (earliest_idx == -1 or idx < earliest_idx):
-                        earliest_idx = idx
-                        matched_delim = d
-
-                if earliest_idx != -1 and matched_delim is not None:
-                    line = pending[:earliest_idx]
-                    pending = pending[earliest_idx + len(matched_delim):]
-                    yield line
-                else:
+                idx, dlen = find_next(pending, search_from)
+                if idx is None:
+                    search_from = max(pos, len(pending) - (max_d - 1))
                     break
-        if pending:
-            yield pending
+                if dlen == -1:
+                    # A lone "\r" ending the buffer is ambiguous: it may be the first
+                    # half of a CRLF pair split across chunks. Defer it until more
+                    # data arrives (or the stream ends) instead of emitting a phantom line.
+                    search_from = idx
+                    break
+                yield pending[pos:idx]
+                pos = idx + dlen
+                search_from = pos
+            if pos:
+                pending = pending[pos:]  # single remainder copy per chunk
+                search_from -= pos
+                absent[cr] = max(0, absent[cr] - pos)
+                absent[lf] = max(0, absent[lf] - pos)
+                pos = 0
+        # Stream exhausted: resolve any deferred trailing CR and flush the remainder.
+        while True:
+            idx, dlen = find_next(pending, search_from)
+            if idx is None:
+                break
+            if dlen == -1:
+                dlen = 1  # final lone CR is a complete line break
+            yield pending[pos:idx]
+            pos = idx + dlen
+            search_from = pos
+        if pending[pos:]:
+            yield pending[pos:]
 
     def close(self) -> None:
         """Releases response resources (idempotent, conforms to requests/httpx API)."""
@@ -361,12 +431,14 @@ def build_response(raw_resp: dict[str, Any], is_byte_response: bool = False) -> 
         if raw_body.startswith("data:") and "," in raw_body:
             base64_str = raw_body.split(",", 1)[1]
             try:
-                response._content = base64.b64decode(base64_str, validate=False)
+                # Strict: invalid characters (spaces, punctuation) must fall back to
+                # raw UTF-8 so plain-text error bodies are never silently mangled.
+                response._content = base64.b64decode(base64_str, validate=True)
             except Exception:
                 response._content = raw_body.encode("utf-8")
         else:
             try:
-                response._content = base64.b64decode(raw_body, validate=False)
+                response._content = base64.b64decode(raw_body, validate=True)
             except Exception:
                 response._content = raw_body.encode("utf-8")
     else:
@@ -381,15 +453,18 @@ def build_response(raw_resp: dict[str, Any], is_byte_response: bool = False) -> 
             if isinstance(cookie, dict) and "name" in cookie and "value" in cookie:
                 response.cookies[cookie["name"]] = cookie["value"]
 
-    # Fallback: Parse Set-Cookie response headers to ensure non-standard or IP-domain
-    # cookies (omitted by Go's RFC 6265 strict jar) are preserved in response.cookies.
+    # Single-parse Set-Cookie handling: build_response parses each header once,
+    # filling response.cookies AND caching the morsels so Session._sync_cookies can
+    # process expiry/deletion without re-running SimpleCookie over the same headers.
     set_cookie_headers = response.headers.getlist("set-cookie") if hasattr(response.headers, "getlist") else []
     if set_cookie_headers:
+        morsels: dict[str, Any] = {}
         for header_val in set_cookie_headers:
             try:
                 sc = SimpleCookie()
                 sc.load(header_val)
                 for cookie_name, morsel in sc.items():
+                    morsels[cookie_name] = morsel
                     max_age = morsel.get("max-age")
                     if max_age:
                         try:
@@ -401,5 +476,6 @@ def build_response(raw_resp: dict[str, Any], is_byte_response: bool = False) -> 
                         response.cookies[cookie_name] = morsel.value
             except Exception:
                 pass
+        response._set_cookie_morsels = morsels
 
     return response

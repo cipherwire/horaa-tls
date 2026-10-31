@@ -113,9 +113,15 @@ class TestLifecycle:
                 calls.append(sid)
                 return True
 
+            def execute(self, payload):
+                return {"status": 200, "target": payload.get("requestUrl", ""),
+                        "headers": {}, "body": "", "cookies": {}}
+
         monkeypatch.setattr("horaa_tls.client.CtypesGoBackend", DestroyableBackend)
         with Session() as s:
             assert not s._closed
+            # A request must run so a Go-side session client exists to destroy.
+            s.get("https://example.com/")
         assert s._closed
         assert calls == [s.session_id]
 

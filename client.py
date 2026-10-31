@@ -9,7 +9,7 @@ from http.cookies import SimpleCookie
 from typing import Any
 
 from horaa_tls.backend.ctypes_go import CtypesGoBackend
-from horaa_tls.exceptions import BackendError, HoraaTLSError
+from horaa_tls.exceptions import BackendError, HoraaTLSError, NetworkError
 from horaa_tls.fingerprint.user_agent import UserAgentGenerator
 from horaa_tls.log import logger
 from horaa_tls.middleware.pipeline import MiddlewarePipeline
@@ -38,6 +38,25 @@ class Session:
     Session object representing a single TLS connection lifecycle, cookies, and parameters.
     Exposes sync and async APIs.
     """
+
+    # Markers identifying Go-side TLS/certificate handshake failures. These stay
+    # BackendError (native TLS layer, deterministic); every other status-0 request
+    # failure is a transport problem and surfaces as NetworkError, matching the
+    # documented error contract in the README.
+    _TLS_ERROR_MARKERS = ("x509", "certificate", "tls:", "handshake")
+
+    @staticmethod
+    def _raise_for_backend_failure(raw_resp: dict[str, Any]) -> None:
+        """Raises the documented exception type for a Go status-0 response.
+
+        BackendError: FFI/TLS-layer failures (certificate verification, handshake).
+        NetworkError: transport failures (timeout, connection refused, DNS, resets).
+        """
+        body = str(raw_resp.get("body") or "Go Request Execution Failed")
+        lowered = body.lower()
+        if any(marker in lowered for marker in Session._TLS_ERROR_MARKERS):
+            raise BackendError(body)
+        raise NetworkError(body)
 
     def __init__(
         self,
@@ -80,7 +99,14 @@ class Session:
             A Session is NOT thread-safe: cookies and proxy-rotator state are
             mutated per request. Use one Session per thread, or serialize access.
         """
-        self.profile = profile.value if isinstance(profile, ClientProfile) else profile
+        # Normalize the identifier exactly like the header generator does (lower-case),
+        # so "CHROME_133" produces matching headers AND a Go identifier that resolves.
+        self.profile = profile.value if isinstance(profile, ClientProfile) else str(profile).strip().lower()
+        if self.profile not in UserAgentGenerator.PROFILE_HEADERS:
+            logger.warning(
+                "Unknown client profile %r: default Chrome 120 headers will be used; "
+                "the Go library validates the identifier at request time.", self.profile,
+            )
         self.insecure_skip_verify = insecure_skip_verify
         self.random_tls_extension_order = random_tls_extension_order
         self.use_mitm_when_active = use_mitm_when_active
@@ -110,14 +136,16 @@ class Session:
         self.redirect_stop_if_contains: str | None = None
 
         self.headers = UserAgentGenerator.generate_headers_for_profile(self.profile)
-        self._headers_cache_id = id(self.headers)
-        self._base_headers_lower = {k.lower(): v for k, v in self.headers.items()}
         self.cookies: dict[str, str] = dict(cookies) if cookies else {}
         # Tracks which host set each cookie (cookie name -> host), so cookies
         # received from site A are never replayed to site B.
         self._cookie_domains: dict[str, str] = {}
-        self.timeout_seconds: float = float(timeout_seconds)
+        self.timeout_seconds: float = self._coerce_timeout_value(timeout_seconds)
         self._closed = False
+        # Set once a request is executed: only then does a Go-side session client
+        # exist that close() needs to destroy. Keeps the finalizer of never-used
+        # sessions from loading (or cold-downloading) the whole native library.
+        self._backend_used = False
 
         # Initialize the Pluggable Middleware Subsystem
         self.middleware_pipeline = MiddlewarePipeline()
@@ -152,7 +180,9 @@ class Session:
             return params.decode("utf-8") if isinstance(params, bytes) else params
         if isinstance(params, (dict, list, tuple)):
             return urllib.parse.urlencode(params, doseq=True)
-        return str(params)
+        raise TypeError(
+            f"params must be str, bytes, dict, or a sequence of pairs, got {type(params).__name__}: {params!r}"
+        )
 
     def _prepare_payload(
         self,
@@ -183,11 +213,11 @@ class Session:
                     url_parts[3] = enc_params
                 url = urllib.parse.urlunsplit(url_parts)
 
-        # 2. Merge headers (case-insensitive with fast cached base)
-        if getattr(self, "_headers_cache_id", None) != id(self.headers):
-            self._headers_cache_id = id(self.headers)
-            self._base_headers_lower = {k.lower(): v for k, v in self.headers.items()}
-        merged_headers = self._base_headers_lower.copy()
+        # 2. Merge headers (case-insensitive). Rebuilt per request: an id()-based
+        # cache cannot detect in-place mutation of self.headers (or id reuse after
+        # rebinding) and silently served stale headers. Rebuilding ~a dozen entries
+        # is negligible next to the FFI + network round trip.
+        merged_headers = {k.lower(): v for k, v in self.headers.items()}
         if headers:
             for k, v in headers.items():
                 k_lower = k.lower()
@@ -222,14 +252,21 @@ class Session:
         if content_type and "content-type" not in merged_headers:
             merged_headers["content-type"] = content_type
 
-        # 4. Merge cookies (domain-aware: only send cookies valid for this host)
-        merged_cookies = self.cookies.copy()
-        if cookies:
-            merged_cookies.update(cookies)
-
+        # 4. Merge cookies. Per-request cookies are explicit user intent: they are
+        # always sent (no host binding) and override same-named session cookies.
+        # Session-level cookies are domain-aware: cookies received from site A are
+        # never replayed to site B.
         target_host = (urllib.parse.urlparse(url).hostname or "").lower()
         request_cookies = []
-        for name, value in merged_cookies.items():
+        if cookies:
+            for name, value in cookies.items():
+                request_cookies.append(
+                    {"name": name, "value": value, "domain": "", "path": "/"}
+                )
+        request_cookie_names = {c["name"] for c in request_cookies}
+        for name, value in self.cookies.items():
+            if name in request_cookie_names:
+                continue  # explicit per-request cookie wins
             cookie_host = self._cookie_domains.get(name, "")
             if cookie_host and not self._host_matches(cookie_host, target_host):
                 continue  # cookie came from a different site - never replay it here
@@ -239,13 +276,7 @@ class Session:
 
         # 5. Build payload
         target_proxy = proxy or self.proxy
-        if self.with_protocol_racing and target_proxy:
-            parsed_p = urllib.parse.urlsplit(target_proxy)
-            if parsed_p.scheme.lower() not in ('socks5', 'socks5h'):
-                raise BackendError(
-                    f"Protocol racing requires a SOCKS5 proxy for HTTP/3 support. "
-                    f"Proxy '{target_proxy}' uses scheme '{parsed_p.scheme}', which only supports TCP and cannot tunnel QUIC/UDP traffic."
-                )
+        self._validate_racing_proxy(target_proxy)
 
         payload = {
             "sessionId": self.session_id,
@@ -284,19 +315,33 @@ class Session:
         return payload
 
     def _resolve_timeout_payload(self, timeout: float | int | None) -> dict[str, int]:
-        """Resolves timeout value into either timeoutSeconds or timeoutMilliseconds for Go FFI."""
+        """Resolves timeout value into either timeoutSeconds or timeoutMilliseconds for Go FFI.
+
+        Note:
+            timeout=0 (or negative) maps to Go's ``timeoutSeconds: 0``, which DISABLES
+            the request timeout entirely (intentional, documented escape hatch).
+            Positive values are never truncated to 0: sub-millisecond timeouts are
+            clamped to 1 ms so a tiny value cannot silently disable the timeout.
+        """
         val = timeout if timeout is not None else self.timeout_seconds
-        try:
-            fval = float(val)
-        except (ValueError, TypeError):
-            fval = 30.0
+        fval = self._coerce_timeout_value(val)
 
         if fval <= 0:
             return {"timeoutSeconds": 0}
-        # Use millisecond precision for fractional/sub-second durations
-        if (fval % 1 != 0) or (0 < fval < 1):
-            return {"timeoutMilliseconds": int(round(fval * 1000))}
+        # Use millisecond precision for fractional/sub-second durations; clamp to >= 1 ms.
+        if (fval % 1 != 0) or (fval < 1):
+            return {"timeoutMilliseconds": max(1, int(round(fval * 1000)))}
         return {"timeoutSeconds": int(fval)}
+
+    @staticmethod
+    def _coerce_timeout_value(val: Any) -> float:
+        """Coerces a timeout to a positive float, rejecting non-numeric input loudly."""
+        if isinstance(val, bool):
+            raise TypeError(f"timeout must be a number, not bool: {val!r}")
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            raise ValueError(f"timeout must be a number, got {val!r}") from None
 
     @staticmethod
     def _host_matches(cookie_host: str, target_host: str) -> bool:
@@ -324,36 +369,43 @@ class Session:
         """Syncs the cookies returned by the request back to the session cookies state,
         remembering which host set each cookie so they are never leaked cross-site,
         and purging cookies that were expired or deleted via Set-Cookie headers."""
-        # 1. Parse Set-Cookie headers for explicit deletion or expiration
-        set_cookie_headers = response.headers.getlist("set-cookie") if hasattr(response.headers, "getlist") else []
-        if set_cookie_headers:
-            now = time.time()
+        # 1. Purge cookies that were expired or deleted via Set-Cookie headers.
+        # build_response already parsed the morsels (single-parse optimization);
+        # handcrafted Response objects without the cache fall back to parsing here.
+        morsels = response._set_cookie_morsels
+        if morsels is None:
+            morsels = {}
+            set_cookie_headers = response.headers.getlist("set-cookie") if hasattr(response.headers, "getlist") else []
             for header_val in set_cookie_headers:
                 try:
                     sc = SimpleCookie()
                     sc.load(header_val)
                     for cookie_name, morsel in sc.items():
-                        is_expired = False
-                        max_age = morsel.get("max-age")
-                        if max_age:
-                            try:
-                                if int(max_age) <= 0:
-                                    is_expired = True
-                            except (ValueError, TypeError):
-                                pass
-                        expires = morsel.get("expires")
-                        if not is_expired and expires:
-                            try:
-                                exp_dt = email.utils.parsedate_to_datetime(expires)
-                                if exp_dt.timestamp() <= now:
-                                    is_expired = True
-                            except Exception:
-                                pass
-                        if is_expired:
-                            self.cookies.pop(cookie_name, None)
-                            self._cookie_domains.pop(cookie_name, None)
+                        morsels[cookie_name] = morsel
                 except Exception:
                     pass
+        if morsels:
+            now = time.time()
+            for cookie_name, morsel in morsels.items():
+                is_expired = False
+                max_age = morsel.get("max-age")
+                if max_age:
+                    try:
+                        if int(max_age) <= 0:
+                            is_expired = True
+                    except (ValueError, TypeError):
+                        pass
+                expires = morsel.get("expires")
+                if not is_expired and expires:
+                    try:
+                        exp_dt = email.utils.parsedate_to_datetime(expires)
+                        if exp_dt.timestamp() <= now:
+                            is_expired = True
+                    except Exception:
+                        pass
+                if is_expired:
+                    self.cookies.pop(cookie_name, None)
+                    self._cookie_domains.pop(cookie_name, None)
 
         # 2. Update active cookies from response
         if response.cookies:
@@ -362,6 +414,23 @@ class Session:
                 self.cookies[name] = value
                 if host:
                     self._cookie_domains[name] = host
+
+    def _validate_racing_proxy(self, proxy_url: str | None) -> None:
+        """Blocks non-SOCKS5 proxies when HTTP/3 protocol racing is enabled.
+
+        HTTP proxies only tunnel TCP and cannot carry QUIC/UDP traffic, so racing
+        with one would leak the real IP and DNS queries. Called both from
+        _prepare_payload (direct proxy argument) and before every backend execution
+        (covers proxies injected later by ProxyRotatorMiddleware).
+        """
+        if not self.with_protocol_racing or not proxy_url:
+            return
+        parsed_p = urllib.parse.urlsplit(proxy_url)
+        if parsed_p.scheme.lower() not in ("socks5", "socks5h"):
+            raise BackendError(
+                f"Protocol racing requires a SOCKS5 proxy for HTTP/3 support. "
+                f"Proxy '{proxy_url}' uses scheme '{parsed_p.scheme}', which only supports TCP and cannot tunnel QUIC/UDP traffic."
+            )
 
     def request(
         self,
@@ -402,12 +471,15 @@ class Session:
         self.middleware_pipeline.execute_before(self, payload)
 
         while True:
+            # Re-validate on every hop: middleware may have swapped/injected a proxy.
+            self._validate_racing_proxy(payload.get("proxyUrl"))
             try:
                 # Execute request via backend FFI
                 raw_resp = self.backend.execute(payload)
+                self._backend_used = True
 
                 if raw_resp.get("status") == 0:
-                    raise BackendError(raw_resp.get("body", "Go Request Execution Failed"))
+                    self._raise_for_backend_failure(raw_resp)
 
                 response = build_response(raw_resp, is_byte_response=is_byte_response)
                 self._sync_cookies(response)
@@ -474,12 +546,15 @@ class Session:
         self.middleware_pipeline.execute_before(self, payload)
 
         while True:
+            # Re-validate on every hop: middleware may have swapped/injected a proxy.
+            self._validate_racing_proxy(payload.get("proxyUrl"))
             try:
                 # Execute request asynchronously via backend FFI
                 raw_resp = await self.backend.execute_async(payload)
+                self._backend_used = True
 
                 if raw_resp.get("status") == 0:
-                    raise BackendError(raw_resp.get("body", "Go Request Execution Failed"))
+                    self._raise_for_backend_failure(raw_resp)
 
                 response = build_response(raw_resp, is_byte_response=is_byte_response)
                 self._sync_cookies(response)
@@ -574,6 +649,11 @@ class Session:
         if self._closed:
             return True
         self._closed = True
+        if not self._backend_used:
+            # No request ever ran: no Go-side session client exists to destroy.
+            # Skipping the FFI call also keeps the finalizer from loading (or on a
+            # cold machine, downloading) the native library just to free nothing.
+            return True
         try:
             return self.backend.destroy_session(self.session_id)
         except Exception as e:
@@ -644,7 +724,19 @@ class Session:
     def from_dict(cls, data: dict[str, Any]) -> 'Session':
         """
         Recreates a Session instance from a dictionary.
+
+        Raises:
+            HoraaTLSError: If restored state has the wrong shape (corrupt/tampered
+                serialization), instead of failing later mid-request.
         """
+        if not isinstance(data, dict):
+            raise HoraaTLSError(f"Session state must be a dict, got {type(data).__name__}")
+        for field in ("headers", "cookies", "cookie_domains"):
+            value = data.get(field)
+            if value is not None and not isinstance(value, dict):
+                raise HoraaTLSError(
+                    f"Corrupt session state: {field!r} must be a dict, got {type(value).__name__}"
+                )
         session = cls(
             profile=data.get("profile", ClientProfile.CHROME_120),
             proxy=data.get("proxy"),
@@ -656,7 +748,7 @@ class Session:
         session.headers = data.get("headers", session.headers)
         session.cookies = data.get("cookies", {})
         session._cookie_domains = data.get("cookie_domains", {})
-        session.timeout_seconds = data.get("timeout_seconds", 30)
+        session.timeout_seconds = cls._coerce_timeout_value(data.get("timeout_seconds", 30))
         session.random_tls_extension_order = data.get("random_tls_extension_order", False)
         session.force_http1 = data.get("force_http1", False)
         session.with_protocol_racing = data.get("with_protocol_racing", False)

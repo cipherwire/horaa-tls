@@ -9,6 +9,7 @@ venv/
 build/
 dist/
 *.egg-info/
+*.dist-info/
 .pytest_cache/
 .ruff_cache/
 .coverage

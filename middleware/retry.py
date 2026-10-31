@@ -1,7 +1,7 @@
 import random
 from typing import Any
 
-from horaa_tls.exceptions import BackendError, NetworkError, TooManyRedirectsError
+from horaa_tls.exceptions import NetworkError, TooManyRedirectsError
 from horaa_tls.log import logger
 from horaa_tls.middleware.base import BaseMiddleware
 from horaa_tls.response import Response
@@ -69,8 +69,10 @@ class RetryMiddleware(BaseMiddleware):
         if isinstance(error, TooManyRedirectsError):
             return None
 
-        # Only retry on network/connection/backend errors
-        if isinstance(error, (NetworkError, BackendError, ConnectionError, TimeoutError)):
+        # Only retry on transport-level errors. BackendError is deliberately excluded:
+        # it signals FFI/TLS-layer failures (certificate verification, handshake,
+        # library load) that are deterministic and can never succeed on retry.
+        if isinstance(error, (NetworkError, ConnectionError, TimeoutError)):
             attempt = payload.get("_retry_attempt", 0)
             if attempt < self.max_retries:
                 delay = self._compute_delay(attempt)

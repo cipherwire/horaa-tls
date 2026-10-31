@@ -54,10 +54,10 @@ class RedirectMiddleware(BaseMiddleware):
 
         # Retrieve/initialize history in active payload
         history: list[Response] = payload.setdefault("_redirect_history", [])
-        if len(history) >= self.max_redirects:
-            raise TooManyRedirectsError(f"Max redirects exceeded (limit: {self.max_redirects})")
 
-        # Check stop conditions if specified on the session
+        # Check stop conditions if specified on the session. These run BEFORE the
+        # max-redirects limit: an explicitly requested stop URL must be honored even
+        # when the history is already at the limit.
         stop_at = getattr(session, "redirect_stop_at", None)
         stop_if_contains = getattr(session, "redirect_stop_if_contains", None)
 
@@ -67,6 +67,9 @@ class RedirectMiddleware(BaseMiddleware):
         if stop_if_contains and stop_if_contains in new_url:
             response.history = history
             return None
+
+        if len(history) >= self.max_redirects:
+            raise TooManyRedirectsError(f"Max redirects exceeded (limit: {self.max_redirects})")
 
         # Append current response to redirect history
         history.append(response)

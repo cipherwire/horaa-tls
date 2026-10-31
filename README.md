@@ -111,7 +111,7 @@ By bridging directly into a precompiled Go-based C-shared library (`bogdanfinn/t
 
 | Operating System | Architectures | Shared Library Format |
 |---|---|---|
-| **Windows** | x86_64 (`amd64`), ARM64 (`arm64`), 32-bit (`386`) | `.dll` |
+| **Windows** | x86_64 (`amd64`), 32-bit (`386`); ARM64 devices run the `amd64` build under Windows-on-ARM emulation (upstream publishes no `windows-arm64` binary) | `.dll` |
 | **Linux (glibc)** | x86_64 (`amd64`), aarch64 (`arm64`), armv7, ppc64le, s390x | `.so` |
 | **macOS (Darwin)** | Apple Silicon (`arm64`), Intel 64-bit (`amd64`) | `.dylib` |
 
