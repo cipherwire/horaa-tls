@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/cipherwire/horaa-tls/compare/v0.3.1...v0.3.2) (2026-10-31)
+
+
+### Bug Fixes
+
+* resolve 31 audit defects and harden hot paths ([be7d10d](https://github.com/cipherwire/horaa-tls/commit/be7d10d0b46016514285144c91a476163504e940))
+
 ## [0.3.1](https://github.com/cipherwire/horaa-tls/compare/v0.3.0...v0.3.1) (2026-10-30)
 
 

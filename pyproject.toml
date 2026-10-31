@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "horaa-tls"
-version = "0.3.1"
+version = "0.3.2"
 description = "Advanced HTTP client with low-level TLS and browser fingerprint spoofing based on Go tls-client FFI"
 readme = "README.md"
 license = "MIT"
